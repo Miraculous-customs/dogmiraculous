@@ -1,1 +1,226 @@
+#!/usr/bin/env python3
+"""Export the supplied free-mesh Blockbench projects as Forge OBJ item models."""
 
+from __future__ import annotations
+
+import base64
+import json
+import math
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MODEL_WORK = ROOT / "model-work"
+ASSETS = ROOT / "src/main/resources/assets/dogmiraculous"
+ITEM_MODELS = ASSETS / "models/item"
+ITEM_TEXTURES = ASSETS / "textures/item"
+
+
+def rotate(point: list[float], origin: list[float], rotation: list[float]) -> tuple[float, float, float]:
+    x, y, z = (point[i] - origin[i] for i in range(3))
+    rx, ry, rz = (math.radians(value) for value in rotation)
+
+    y, z = y * math.cos(rx) - z * math.sin(rx), y * math.sin(rx) + z * math.cos(rx)
+    x, z = x * math.cos(ry) + z * math.sin(ry), -x * math.sin(ry) + z * math.cos(ry)
+    x, y = x * math.cos(rz) - y * math.sin(rz), x * math.sin(rz) + y * math.cos(rz)
+    return x + origin[0], y + origin[1], z + origin[2]
+
+
+def normal(points: list[tuple[float, float, float]]) -> tuple[float, float, float]:
+    if len(points) < 3:
+        return 0.0, 1.0, 0.0
+    a = tuple(points[1][i] - points[0][i] for i in range(3))
+    b = tuple(points[2][i] - points[0][i] for i in range(3))
+    n = (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+    length = math.sqrt(sum(value * value for value in n)) or 1.0
+    return tuple(value / length for value in n)
+
+
+def export_obj(
+    source: Path,
+    output_name: str,
+    texture_names: list[str],
+    fallback_materials: dict[str, int] | None = None,
+) -> None:
+    data = json.loads(source.read_text())
+    width = float(data["resolution"]["width"])
+    height = float(data["resolution"]["height"])
+    fallback_materials = fallback_materials or {}
+
+    obj = [f"mtllib {output_name}.mtl", "o " + output_name]
+    vertex_offset = 1
+    uv_offset = 1
+    normal_offset = 1
+
+    for element_index, element in enumerate(data.get("elements", [])):
+        if element.get("type") != "mesh":
+            continue
+
+        vertices = element.get("vertices", {})
+        origin = element.get("origin", [0.0, 0.0, 0.0])
+        rotation = element.get("rotation", [0.0, 0.0, 0.0])
+        transformed = {
+            key: tuple(value / 16.0 for value in rotate(point, origin, rotation))
+            for key, point in vertices.items()
+        }
+        vertex_index = {}
+        obj.append(f"g {element.get('name', 'mesh')}_{element_index}")
+
+        for key, point in transformed.items():
+            vertex_index[key] = vertex_offset
+            vertex_offset += 1
+            obj.append(f"v {point[0]:.8f} {point[1]:.8f} {point[2]:.8f}")
+
+        for face in element.get("faces", {}).values():
+            keys = face.get("vertices", [])
+            if len(keys) < 3:
+                continue
+            texture_index = face.get("texture")
+            if texture_index is None:
+                texture_index = fallback_materials.get(element.get("name", ""), 0)
+            texture_index = int(texture_index)
+            obj.append(f"usemtl material_{texture_index}")
+
+            face_points = [transformed[key] for key in keys]
+            face_normal = normal(face_points)
+            obj.append(f"vn {face_normal[0]:.8f} {face_normal[1]:.8f} {face_normal[2]:.8f}")
+            current_normal = normal_offset
+            normal_offset += 1
+
+            face_uvs = []
+            uv_map = face.get("uv", {})
+            for key in keys:
+                uv = uv_map.get(key, [0.0, 0.0])
+                obj.append(f"vt {float(uv[0]) / width:.8f} {1.0 - float(uv[1]) / height:.8f}")
+                face_uvs.append(uv_offset)
+                uv_offset += 1
+
+            obj.append("f " + " ".join(
+                f"{vertex_index[key]}/{face_uvs[index]}/{current_normal}"
+                for index, key in enumerate(keys)
+            ))
+
+    mtl = []
+    for index, texture_name in enumerate(texture_names):
+        mtl.extend([
+            f"newmtl material_{index}",
+            "Ka 1.000000 1.000000 1.000000",
+            "Kd 1.000000 1.000000 1.000000",
+            "Ks 0.000000 0.000000 0.000000",
+            "d 1.000000",
+            "illum 1",
+            f"map_Kd #texture{index}",
+            "",
+        ])
+
+    (ITEM_MODELS / f"{output_name}.obj").write_text("\n".join(obj) + "\n")
+    (ITEM_MODELS / f"{output_name}.mtl").write_text("\n".join(mtl))
+
+
+def display(rotation: list[float], translation: list[float], scale: list[float]) -> dict:
+    return {"rotation": rotation, "translation": translation, "scale": scale}
+
+
+def obj_json(model: str, textures: list[str], collar: bool = False) -> dict:
+    if collar:
+        transforms = {
+            "thirdperson_righthand": display([90, 0, 0], [0, 1.5, 0], [1.1, 1.1, 1.1]),
+            "thirdperson_lefthand": display([90, 0, 0], [0, 1.5, 0], [1.1, 1.1, 1.1]),
+            "firstperson_righthand": display([90, 0, 0], [0, 2.0, 0], [1.25, 1.25, 1.25]),
+            "firstperson_lefthand": display([90, 0, 0], [0, 2.0, 0], [1.25, 1.25, 1.25]),
+            "gui": display([90, 0, 0], [0, 0, 0], [1.5, 1.5, 1.5]),
+            "ground": display([0, 0, 0], [0, 2.5, 0], [1.0, 1.0, 1.0]),
+            "fixed": display([90, 0, 0], [0, 0, 0], [1.25, 1.25, 1.25]),
+        }
+    else:
+        transforms = {
+            "thirdperson_righthand": display([0, 0, 0], [0, 2.5, 0], [2.2, 2.2, 2.2]),
+            "thirdperson_lefthand": display([0, 0, 0], [0, 2.5, 0], [2.2, 2.2, 2.2]),
+            "firstperson_righthand": display([0, 0, 0], [0, 2.0, 0], [2.5, 2.5, 2.5]),
+            "firstperson_lefthand": display([0, 0, 0], [0, 2.0, 0], [2.5, 2.5, 2.5]),
+            "gui": display([30, 225, 0], [0, 0, 0], [2.4, 2.4, 2.4]),
+            "ground": display([0, 0, 0], [0, 2.5, 0], [1.8, 1.8, 1.8]),
+            "fixed": display([0, 0, 0], [0, 0, 0], [2.0, 2.0, 2.0]),
+        }
+
+    return {
+        "loader": "forge:obj",
+        "flip_v": False,
+        "model": f"dogmiraculous:models/item/{model}.obj",
+        "textures": {
+            **{f"texture{index}": f"dogmiraculous:item/{texture}" for index, texture in enumerate(textures)},
+            "particle": f"dogmiraculous:item/{textures[0]}",
+        },
+        "display": transforms,
+    }
+
+
+def extract_embedded_texture(source: Path, texture_index: int, destination: Path) -> None:
+    data = json.loads(source.read_text())
+    encoded = data["textures"][texture_index]["source"].split(",", 1)[1]
+    destination.write_bytes(base64.b64decode(encoded))
+
+
+def main() -> None:
+    ITEM_MODELS.mkdir(parents=True, exist_ok=True)
+    ITEM_TEXTURES.mkdir(parents=True, exist_ok=True)
+
+    ball_textures = [
+        "dog_ball_white",
+        "dog_ball_shell",
+        "balltexture1",
+        "balltexture2",
+        "balltexture3",
+        "balltexture5",
+        "balltexture4",
+    ]
+    export_obj(
+        MODEL_WORK / "dog_ball/dog_ball.bbmodel",
+        "dog_ball",
+        ball_textures,
+        {"orange_teardrop_rim": 6, "white_teardrop_panel": 0},
+    )
+    extract_embedded_texture(
+        MODEL_WORK / "dog_ball/dog_ball.bbmodel",
+        1,
+        ITEM_TEXTURES / "dog_ball_shell.png",
+    )
+    (ITEM_MODELS / "dog_ball.json").write_text(
+        json.dumps(obj_json("dog_ball", ball_textures), indent=2) + "\n"
+    )
+
+    active_textures = [
+        "dog_collar_active",
+        "activetexture1",
+        "activetexture2",
+        "activetexture3",
+    ]
+    export_obj(
+        MODEL_WORK / "dog_collar_active/dog_collar_active.bbmodel",
+        "dog_collar_active",
+        active_textures,
+    )
+    (ITEM_MODELS / "dog_collar_active.json").write_text(
+        json.dumps(obj_json("dog_collar_active", active_textures, collar=True), indent=2) + "\n"
+    )
+
+    camo_textures = ["dog_collar_camo"]
+    export_obj(
+        MODEL_WORK / "dog_collar_camo/dog_collar_camo.bbmodel",
+        "dog_collar_camo",
+        camo_textures,
+    )
+    camo_model = obj_json("dog_collar_camo", camo_textures, collar=True)
+    camo_model["overrides"] = [{
+        "predicate": {"dogmiraculous:active": 1.0},
+        "model": "dogmiraculous:item/dog_collar_active",
+    }]
+    (ITEM_MODELS / "dog_collar.json").write_text(json.dumps(camo_model, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()
